@@ -494,36 +494,48 @@ class AgentEngine(
                 context = ToolContext(execWorkspace, sandboxOff, sessionId, configuration = projectConfig, skills = runContext.skills),
             )
             val environment = if (agentContextEnabled)
-                runtimeEnvironment(workspace, sessionId, mode, effectiveMode, tools, conversation.isChat) +
+                runtimeEnvironment(workspace, sessionId, mode, effectiveMode, conversation.isChat) +
                     modelIdentity(config, options.modelCatalogs) +
                     searchConfiguration?.let { "\n## Current web research configuration\n$it\n" }.orEmpty() else ""
             turnImages.update(working)
             val imageInventory = if (conversation.isChat && visionAvailable)
                 com.androidharness.app.tools.ChatImageInventory.promptSources(turnImages.sources(), imageStore::metadata) else ""
-            var requestSystemPrompt = if (!agentContextEnabled) "" else if (conversation.isChat) systemPrompt + environment + imageInventory else com.androidharness.app.caveman.CavemanPolicy.apply(
-                systemPrompt + environment + TodoPrompt.format(
-                    todoStore?.takeIf { !conversation.isChat && it.owner.value == sessionId }?.todos?.value.orEmpty(),
-                    roundsWithoutTodoUpdate,
-                ).let { if (it.isBlank()) "" else "\n\n$it" },
+            // Keep the cacheable prefix stable. Runtime state changes during a
+            // run belong in a trailing request-only context message.
+            val requestSystemPrompt = if (!agentContextEnabled) "" else if (conversation.isChat) systemPrompt else com.androidharness.app.caveman.CavemanPolicy.apply(
+                systemPrompt,
                 installed = replySettings.cavemanInstalled,
                 intensity = replySettings.cavemanIntensity,
                 wenyan = replySettings.cavemanWenyan,
             )
+            var requestContext = if (!agentContextEnabled) "" else buildString {
+                append(environment)
+                if (conversation.isChat) append(imageInventory)
+                else append(TodoPrompt.format(
+                    todoStore?.takeIf { !conversation.isChat && it.owner.value == sessionId }?.todos?.value.orEmpty(),
+                    roundsWithoutTodoUpdate,
+                ).let { if (it.isBlank()) "" else "\n\n$it" })
+            }
             if (agentContextEnabled) {
                 val before = if (hooksActive) hook(com.androidharness.app.config.HookEvents.PROMPT, kotlinx.serialization.json.buildJsonObject {
                     put("agent", runContext.agent); put("iteration", iterations)
                 }) else com.androidharness.app.config.HookResult()
                 earlyNotices.forEach { emit(AgentEvent.Notice(it)) }; earlyNotices.clear()
-                requestSystemPrompt += runContext.drainInstructions().let { if (it.isBlank()) "" else "\n\n$it" } +
+                requestContext += runContext.drainInstructions().let { if (it.isBlank()) "" else "\n\n$it" } +
                     before.instructions.let { if (it.isBlank()) "" else "\n\n$it" }
             }
+            fun messagesForRequest(): List<ChatMessage> = if (requestContext.isBlank()) working.toList()
+                else working + ChatMessage(
+                    role = Role.USER,
+                    text = "[AndroidHarness runtime context for this request]\n$requestContext",
+                )
             runContext.stopRequested.get()?.let { reason ->
                 emit(AgentEvent.Notice("A plugin hook stopped the run: $reason"))
                 emit(AgentEvent.Finished())
                 break
             }
             // Auto-compact before the request grows past the context budget.
-            val estimate = estimateContext(working, requestSystemPrompt, tools, withBreakdown = true)
+            val estimate = estimateContext(messagesForRequest(), requestSystemPrompt, tools, withBreakdown = true)
             emit(AgentEvent.EstimatedContext(estimate))
             val compactThreshold = if (conversation.isChat) ChatContextPolicy.compactAt(contextLimit, requestOptions.maxOutputTokens)
                 else AutoCompaction.threshold(autoCompactTokens(), contextLimit, requestOptions.maxOutputTokens)
@@ -544,16 +556,16 @@ class AgentEngine(
                     working.addAll(compacted)
                     // The window just shrank: refresh the context panel now
                     // instead of waiting for the next request's usage row.
-                    emit(AgentEvent.EstimatedContext(estimateContext(working, requestSystemPrompt, tools, withBreakdown = true)))
+                    emit(AgentEvent.EstimatedContext(estimateContext(messagesForRequest(), requestSystemPrompt, tools, withBreakdown = true)))
                 }
-                if (conversation.isChat && estimateContext(working, requestSystemPrompt, tools).total >= compactThreshold) {
+                if (conversation.isChat && estimateContext(messagesForRequest(), requestSystemPrompt, tools).total >= compactThreshold) {
                     emit(AgentEvent.Error("The latest message is too large for the available context. Shorten it or choose a model with a larger context."))
                     break
                 }
             }
 
             // Mirrors what this round sends, so /btw replays the same cached prefix.
-            fun publishSide(messages: List<ChatMessage> = working) = sideContexts.publish(SideContext(
+            fun publishSide(messages: List<ChatMessage> = messagesForRequest()) = sideContexts.publish(SideContext(
                 sessionId, turnId, config, apiKey, requestSystemPrompt, tools, messages.toList(), requestOptions,
                 roundRegistry, execWorkspace, sandboxOff, effectiveMode, runContext))
 
@@ -675,7 +687,7 @@ class AgentEngine(
             var failure = StreamRetrier.run(
                 streamFor = {
                     publishSide()
-                    provider.streamChat(config, apiKey, requestSystemPrompt, working, tools, requestOptions)
+                    provider.streamChat(config, apiKey, requestSystemPrompt, messagesForRequest(), tools, requestOptions)
                 },
                 onAttemptStart = {
                     codeTracker.clear()
@@ -717,12 +729,12 @@ class AgentEngine(
                         .let { if (nextReplySettings.subagentsEnabled) it else it.without(SUBAGENT_TOOLS) }
                 .let { if (nextReplySettings.storageAccessCards) it else it.without(setOf(com.androidharness.app.tools.StorageAccessTool.NAME)) }
                     tools = tools.filterNot { it.name in setOf("view_chat_image", "zoom_chat_image") }
-                    requestSystemPrompt += "\nImage input was rejected by the provider. You cannot inspect or zoom images in this turn; say so rather than claiming to see them.\n"
+                    requestContext += "\nImage input was rejected by the provider. You cannot inspect or zoom images in this turn; say so rather than claiming to see them.\n"
                 }
                 failure = StreamRetrier.run(
                     streamFor = {
                         publishSide()
-                        provider.streamChat(config, apiKey, requestSystemPrompt, working, tools, requestOptions)
+                        provider.streamChat(config, apiKey, requestSystemPrompt, messagesForRequest(), tools, requestOptions)
                     },
                     onAttemptStart = {
                         codeTracker.clear()
@@ -1934,7 +1946,7 @@ class AgentEngine(
             }
             val subTools = subagentTools(registry.filter { runConfig?.denies(it) != true && (runConfig == null || com.androidharness.app.config.ConfigToolPolicy.permission(runConfig.config, it, permissionMode) != "deny") }, ctx, actionTools)
             val liveSystem = system + (runConfig?.config?.prompt(runConfig.agent) ?: "") + runtimeEnvironment(workspace, sessionId,
-                if (actionTools) AgentMode.ACT else AgentMode.PLAN, permissionMode, subTools) +
+                if (actionTools) AgentMode.ACT else AgentMode.PLAN, permissionMode) +
                 modelIdentity(config, requestOptions.modelCatalogs)
             val managedFallback = kotlin.coroutines.coroutineContext[com.androidharness.app.llm.FallbackRun]?.policy()?.enabled == true
 
@@ -2204,7 +2216,7 @@ class AgentEngine(
             .let { if (conversation.personalizationEnabled) it else it.without(recallToolNames) }
             .schemas(readOnlyOnly = mode == AgentMode.PLAN, context = ToolContext(workspace, fullAccess, sessionId))
         val environment = runtimeEnvironment(workspace, sessionId, mode,
-            if (fullAccess) PermissionMode.FULL_ACCESS else PermissionMode.CONFIRM_RISKY, tools, conversation.isChat)
+            if (fullAccess) PermissionMode.FULL_ACCESS else PermissionMode.CONFIRM_RISKY, conversation.isChat)
         return estimateContext(
             history,
             if (conversation.isChat) chatSystemPrompt(sessionId, searchDepth, conversation, chatImageFrequency, chatInstructions, recentMemoryQuery(history)) + environment else com.androidharness.app.caveman.CavemanPolicy.apply(
@@ -2442,11 +2454,9 @@ ${if (appSettings.subagentsEnabled) "- For broad exploration whose raw output wo
         sessionId: String?,
         mode: AgentMode,
         permission: PermissionMode,
-        tools: List<com.androidharness.app.llm.ToolSchema>,
         chatOnly: Boolean = false,
     ): String = withContext(Dispatchers.IO) {
-        if (chatOnly) return@withContext "\n## Live AndroidHarness environment\nSection: Chat. This request has conversation-only capabilities; device connections do not provide filesystem, shell, root or Shizuku access in Chat.\n" +
-            HarnessEnvironmentPrompt.toolIndex(tools)
+        if (chatOnly) return@withContext "\n## Live AndroidHarness environment\nSection: Chat. Conversation-only capabilities are enabled. Device connections do not provide filesystem, shell, root or Shizuku access in Chat.\n"
         val selected = workspace as? ChatWorkspaceFs
         val bindings = selected?.bindings ?: listOf(com.androidharness.app.workspace.ChatWorkspaceBinding("", "Current workspace", true, workspace))
         buildString {
@@ -2502,7 +2512,6 @@ ${if (appSettings.subagentsEnabled) "- For broad exploration whose raw output wo
                 if (!linuxEnv.storageAccessGranted) append("Storage access is optional and the user has not granted it. Shared storage (/sdcard, /storage/emulated/0: Download, Documents, DCIM and other device folders) is blocked for file tools and for commands that run as the app user; the app asks the user when a call is blocked. The app workspace and folders the user picked keep working. Do not probe shared storage or route around a block.\n")
                 append("Use the active command's PREFIX, JAVA_HOME and HARNESS_SCRATCH; the harness sets PATH and library loading for the execution tier. Never borrow another app/package's prefix or invoke linker/su/sudo workarounds. Use pkg_search/pkg_install instead of apt/pkg directly.\n")
             }
-            append(HarnessEnvironmentPrompt.toolIndex(tools))
         }
     }
 
