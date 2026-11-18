@@ -432,6 +432,8 @@ class AgentEngine(
             return messages.isNotEmpty()
         }
 
+        var cachedEnvironmentKey: String? = null
+        var cachedEnvironment = ""
         while (true) {
             kotlin.coroutines.coroutineContext[TaskBudget]?.check()
             // Results land only between model requests. Persist before acknowledging so
@@ -468,7 +470,7 @@ class AgentEngine(
             val sandboxOff = !conversation.isChat && effectiveMode == PermissionMode.FULL_ACCESS
             val nextReplySettings = cavemanSettings()
             val nextMemoryQuery = recentMemoryQuery(working)
-            if (sandboxOff != promptSandboxOff || replySettings != nextReplySettings || nextMemoryQuery != memoryQuery || iterations > 1) {
+            if (sandboxOff != promptSandboxOff || replySettings != nextReplySettings || nextMemoryQuery != memoryQuery) {
                 memoryQuery = nextMemoryQuery
                 replySettings = nextReplySettings
                 promptSandboxOff = sandboxOff
@@ -493,23 +495,27 @@ class AgentEngine(
                 readOnlyOnly = mode == AgentMode.PLAN,
                 context = ToolContext(execWorkspace, sandboxOff, sessionId, configuration = projectConfig, skills = runContext.skills),
             )
-            val environment = if (agentContextEnabled)
-                runtimeEnvironment(workspace, sessionId, mode, effectiveMode, conversation.isChat) +
+            val environmentKey = listOf(config.id, config.model, mode.name, effectiveMode.name,
+                conversation.isChat.toString(), searchConfiguration.orEmpty()).joinToString("|")
+            if (agentContextEnabled && environmentKey != cachedEnvironmentKey) {
+                cachedEnvironmentKey = environmentKey
+                cachedEnvironment = runtimeEnvironment(workspace, sessionId, mode, effectiveMode, conversation.isChat) +
                     modelIdentity(config, options.modelCatalogs) +
-                    searchConfiguration?.let { "\n## Current web research configuration\n$it\n" }.orEmpty() else ""
+                    searchConfiguration?.let { "\n## Current web research configuration\n$it\n" }.orEmpty()
+            }
+            val environment = if (agentContextEnabled) cachedEnvironment else ""
             turnImages.update(working)
             val imageInventory = if (conversation.isChat && visionAvailable)
                 com.androidharness.app.tools.ChatImageInventory.promptSources(turnImages.sources(), imageStore::metadata) else ""
             // Keep the cacheable prefix stable. Runtime state changes during a
             // run belong in a trailing request-only context message.
-            val requestSystemPrompt = if (!agentContextEnabled) "" else if (conversation.isChat) systemPrompt else com.androidharness.app.caveman.CavemanPolicy.apply(
-                systemPrompt,
+            val requestSystemPrompt = if (!agentContextEnabled) "" else if (conversation.isChat) systemPrompt + environment else com.androidharness.app.caveman.CavemanPolicy.apply(
+                systemPrompt + environment,
                 installed = replySettings.cavemanInstalled,
                 intensity = replySettings.cavemanIntensity,
                 wenyan = replySettings.cavemanWenyan,
             )
             var requestContext = if (!agentContextEnabled) "" else buildString {
-                append(environment)
                 if (conversation.isChat) append(imageInventory)
                 else append(TodoPrompt.format(
                     todoStore?.takeIf { !conversation.isChat && it.owner.value == sessionId }?.todos?.value.orEmpty(),
