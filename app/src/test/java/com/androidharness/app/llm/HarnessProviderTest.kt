@@ -21,6 +21,13 @@ class HarnessProviderTest {
         assertEquals("openai-fast", HarnessProvider.sanitize("openai-fast"))
     }
 
+    @Test fun missingCacheKeyUsesStableProviderIdentity() {
+        val config = ProviderConfig("provider-1", "Provider", ProviderType.OPENAI_COMPAT,
+            "https://example.test/v1", "model-a")
+        assertEquals("provider:provider-1:model-a", HarnessProvider.stableCacheKey(config))
+        assertEquals(HarnessProvider.stableCacheKey(config), HarnessProvider.stableCacheKey(config))
+    }
+
     @Test fun customModelsSurviveSanitize() {
         assertEquals("my-custom-model", HarnessProvider.sanitize("my-custom-model", setOf("my-custom-model")))
         assertEquals(HarnessProvider.DEFAULT_MODEL, HarnessProvider.sanitize("my-custom-model", setOf("other")))

@@ -244,8 +244,14 @@ object HarnessProvider {
             val wire = wire(config.model)
             val baseUrl = if (wire == ProviderType.ANTHROPIC) BASE_URL.removeSuffix("/v1") else BASE_URL
             val routed = config.copy(type = wire, baseUrl = baseUrl)
+            // A missing cache key used to be replaced with a fresh UUID for
+            // every request. That guarantees a different routing identity on
+            // each retry/turn and defeats upstream prompt caches. Callers that
+            // own a conversation pass their session id. For the remaining
+            // requests use one stable provider/model identity instead of
+            // manufacturing a per-request key.
             val routedOptions = if (options.cacheKey.isNullOrBlank()) {
-                options.copy(cacheKey = UUID.randomUUID().toString())
+                options.copy(cacheKey = stableCacheKey(config))
             } else options
             val http = if (key != null) keyedClient else client
             val provider = when (wire) {
@@ -256,4 +262,7 @@ object HarnessProvider {
             return provider.streamChat(routed, key ?: KEYLESS, systemPrompt, messages, tools, routedOptions)
         }
     }
+
+    internal fun stableCacheKey(config: ProviderConfig): String =
+        "provider:${config.id}:${config.model}"
 }
